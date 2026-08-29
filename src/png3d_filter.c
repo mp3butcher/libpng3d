@@ -232,22 +232,26 @@ png3d_unfilter_row_paeth3(png_struct *png_ptr, png_row_info *row_info,
  * STATE MANAGEMENT
  * ============================================================================
  */
-
 /* Internal state for tracking 3D filter context during write */
 struct png3d_write_state
 {
-    png3d_pvs3_t pvs3;
-    png_byte **z_buffers;
-    png_uint_32 z_buffer_count;
-    png_uint_32 current_z;
-    png_uint_32 current_row_in_z;
-    size_t rowbytes;
-    png3d_filter_fn filter_fn;
+    png3d_pvs3_t pvs3;              /* PVS3 parameters */
+    /* Buffers holding the original rows from the previous z-layer.
+     * Indexed by row index within a cell (0..rowsPerCell-1). */
+    png_byte **prev_z_buffers;
+    png_uint_32 z_buffer_count;     /* Number of rows allocated (rowsPerCell) */
 
-    /* new: scratch buffer to hold the original (unfiltered) row so we can
-     * save it into z_buffers after filtering without overwriting predictors.
-     */
+    /* Buffer holding the previous row in the current z-layer (original bytes). */
+    png_byte *last_row;
+
+    /* Scratch buffer to hold the original (unfiltered) current row so we can
+     * store originals into prev_z_buffers and last_row after filtering. */
     png_byte *temp_row;
+
+    png_uint_32 current_z;          /* Current z-layer index */
+    png_uint_32 current_row_in_z;   /* Row index within current z-layer */
+    size_t rowbytes;                /* Bytes per row */
+    png3d_filter_fn filter_fn;      /* Active filter function */
 };
 
 /* Allocate 3D filter write state */
@@ -268,13 +272,17 @@ png3d_write_state_new(png_struct *png_ptr, const png3d_pvs3_t *pvs3,
     state->rowbytes = rowbytes;
     state->current_z = 0;
     state->current_row_in_z = 0;
-    state->z_buffer_count = pvs3->rowsPerCell;  /* Keep one z-layer in memory */
 
-    /* Allocate z-layer buffers (one full layer) */
-    state->z_buffers = (png_byte **)png_malloc(png_ptr,
+    /* Keep one z-layer in memory: allocate prev_z_buffers with rowsPerCell rows */
+    state->z_buffer_count = pvs3->rowsPerCell;
+    if (state->z_buffer_count == 0)
+        state->z_buffer_count = 1;
+
+    /* Allocate prev_z_buffers (one full layer of original rows) */
+    state->prev_z_buffers = (png_byte **)png_malloc(png_ptr,
         sizeof(png_byte *) * state->z_buffer_count);
 
-    if (state->z_buffers == NULL)
+    if (state->prev_z_buffers == NULL)
     {
         png_free(png_ptr, state);
         return NULL;
@@ -282,26 +290,39 @@ png3d_write_state_new(png_struct *png_ptr, const png3d_pvs3_t *pvs3,
 
     for (i = 0; i < state->z_buffer_count; i++)
     {
-        state->z_buffers[i] = (png_byte *)png_calloc(png_ptr, rowbytes);
-        if (state->z_buffers[i] == NULL)
+        state->prev_z_buffers[i] = (png_byte *)png_calloc(png_ptr, rowbytes);
+        if (state->prev_z_buffers[i] == NULL)
         {
             for (png_uint_32 j = 0; j < i; j++)
-                png_free(png_ptr, state->z_buffers[j]);
-            png_free(png_ptr, state->z_buffers);
+                png_free(png_ptr, state->prev_z_buffers[j]);
+            png_free(png_ptr, state->prev_z_buffers);
             png_free(png_ptr, state);
             return NULL;
         }
     }
-/* allocate the temp_row once (rowbytes bytes) */
-state->temp_row = (png_byte *)png_calloc(png_ptr, rowbytes);
-if (state->temp_row == NULL)
-{
-    for (png_uint_32 j = 0; j < i; j++)
-        png_free(png_ptr, state->z_buffers[j]);
-    png_free(png_ptr, state->z_buffers);
-    png_free(png_ptr, state);
-    return NULL;
-}
+
+    /* Allocate last_row and temp_row buffers */
+    state->last_row = (png_byte *)png_calloc(png_ptr, rowbytes);
+    if (state->last_row == NULL)
+    {
+        for (i = 0; i < state->z_buffer_count; i++)
+            png_free(png_ptr, state->prev_z_buffers[i]);
+        png_free(png_ptr, state->prev_z_buffers);
+        png_free(png_ptr, state);
+        return NULL;
+    }
+
+    state->temp_row = (png_byte *)png_calloc(png_ptr, rowbytes);
+    if (state->temp_row == NULL)
+    {
+        png_free(png_ptr, state->last_row);
+        for (i = 0; i < state->z_buffer_count; i++)
+            png_free(png_ptr, state->prev_z_buffers[i]);
+        png_free(png_ptr, state->prev_z_buffers);
+        png_free(png_ptr, state);
+        return NULL;
+    }
+
     /* Select filter function based on predictor */
     if (pvs3->predictor == 0)  /* XOR */
         state->filter_fn = png3d_filter_row_xor;
@@ -320,52 +341,55 @@ png3d_write_state_free(png_struct *png_ptr, struct png3d_write_state *state)
     if (state == NULL)
         return;
 
-    if (state->z_buffers != NULL)
+    if (state->prev_z_buffers != NULL)
     {
         png_uint_32 i;
         for (i = 0; i < state->z_buffer_count; i++)
         {
-            if (state->z_buffers[i] != NULL)
-                png_free(png_ptr, state->z_buffers[i]);
+            if (state->prev_z_buffers[i] != NULL)
+                png_free(png_ptr, state->prev_z_buffers[i]);
         }
-        png_free(png_ptr, state->z_buffers);
+        png_free(png_ptr, state->prev_z_buffers);
     }
+
+    if (state->last_row != NULL)
+        png_free(png_ptr, state->last_row);
     if (state->temp_row != NULL)
         png_free(png_ptr, state->temp_row);
+
     png_free(png_ptr, state);
 }
 
+/* Apply 3D filter to a row during write */
 void
 png3d_filter_write_row(png_struct *png_ptr, png_row_info *row_info,
     png_byte *row, struct png3d_write_state *state)
 {
-    png_byte *prev_row = NULL;     /* Row above in XY plane */
-    png_byte *prev_z_row = NULL;   /* Row in previous Z layer */
+    png_byte *prev_row = NULL;     /* Row above in XY plane (original bytes) */
+    const png_byte *prev_z_row = NULL;   /* Row in previous Z layer (original bytes) */
 
     if (state == NULL || state->filter_fn == NULL)
         return;
 
-    /* Get previous row in XY plane (if not first row) */
+    /* prev_row: previous original row within the same z-layer */
     if (state->current_row_in_z > 0)
-        prev_row = state->z_buffers[(state->current_row_in_z - 1) % 
-                                     state->z_buffer_count];
+        prev_row = state->last_row;
 
-    /* Get previous row in Z dimension (if not first z-layer) */
+    /* prev_z_row: original row from previous z-layer at same row index */
     if (state->current_z > 0)
-        prev_z_row = state->z_buffers[state->current_row_in_z];
+        prev_z_row = state->prev_z_buffers[state->current_row_in_z];
 
-    /* Make a copy of the original row (unfiltered). We must save the original
-     * bytes into the z_buffers for later predictors, but we must not overwrite
-     * prev_z_row (which points at the same slot) until we've used it in the
-     * filter computation — so copy original into a temp buffer first.
-     */
+    /* Save original (unfiltered) row into temp_row */
     memcpy(state->temp_row, row, row_info->rowbytes);
 
-    /* Apply the 3D filter in-place (this mutates 'row' to the filtered form) */
+    /* Apply the 3D filter in-place (mutates 'row' into residuals) */
     state->filter_fn(png_ptr, row_info, row, prev_row, prev_z_row);
 
-    /* Save the ORIGINAL (unfiltered) row into the z_buffer slot for future use */
-    memcpy(state->z_buffers[state->current_row_in_z], state->temp_row, row_info->rowbytes);
+    /* Save ORIGINAL (unfiltered) row into prev_z_buffers for the next z-layer */
+    memcpy(state->prev_z_buffers[state->current_row_in_z], state->temp_row, row_info->rowbytes);
+
+    /* Save ORIGINAL into last_row so the next row in this z-layer can use it as prev_row */
+    memcpy(state->last_row, state->temp_row, row_info->rowbytes);
 
     /* Update position tracking */
     state->current_row_in_z++;
@@ -374,10 +398,15 @@ png3d_filter_write_row(png_struct *png_ptr, png_row_info *row_info,
         state->current_row_in_z = 0;
         state->current_z++;
     }
-} 
+}
 
+/* ------------------------------------------------------------------ */
+/* Thin public wrappers so applications (demo writer) can use the state */
+/* ------------------------------------------------------------------ */
 
-/* Add near bottom of src/png3d_filter.c (after static helpers) */
+/* The header png3d_filter.h exposes these prototypes. Provide definitions
+ * here so demo code can link without touching internal static names.
+ */
 png3d_write_state_t *
 png3d_write_state_new_public(png_struct *png_ptr, const png3d_pvs3_t *pvs3,
     size_t rowbytes)
@@ -397,3 +426,5 @@ png3d_filter_write_row_public(png_struct *png_ptr, png_row_info *row_info,
 {
     png3d_filter_write_row(png_ptr, row_info, row, (struct png3d_write_state *)state);
 }
+
+
