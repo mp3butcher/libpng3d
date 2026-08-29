@@ -1,4 +1,4 @@
-`/* png3d_filter.c
+/* png3d_filter.c
  * Implementation of 3D filtering for PVS data.
  *
  * This module implements the core 3D filter logic that operates on
@@ -9,7 +9,7 @@
  *  - 3D grid-aware unfiltering during read
  */
 
-#include "png.h"
+#include "png3d_filter.h"
 #include "png3d.h"
 #include <string.h>
 #include <stdlib.h>
@@ -236,13 +236,18 @@ png3d_unfilter_row_paeth3(png_struct *png_ptr, png_row_info *row_info,
 /* Internal state for tracking 3D filter context during write */
 struct png3d_write_state
 {
-    png3d_pvs3_t pvs3;              /* PVS3 parameters */
-    png_byte **z_buffers;           /* Buffers for previous z-layer rows */
-    png_uint_32 z_buffer_count;     /* Number of z-buffers allocated */
-    png_uint_32 current_z;          /* Current z-layer index */
-    png_uint_32 current_row_in_z;   /* Row index within current z-layer */
-    size_t rowbytes;                /* Bytes per row */
-    png3d_filter_fn filter_fn;      /* Active filter function */
+    png3d_pvs3_t pvs3;
+    png_byte **z_buffers;
+    png_uint_32 z_buffer_count;
+    png_uint_32 current_z;
+    png_uint_32 current_row_in_z;
+    size_t rowbytes;
+    png3d_filter_fn filter_fn;
+
+    /* new: scratch buffer to hold the original (unfiltered) row so we can
+     * save it into z_buffers after filtering without overwriting predictors.
+     */
+    png_byte *temp_row;
 };
 
 /* Allocate 3D filter write state */
@@ -287,7 +292,16 @@ png3d_write_state_new(png_struct *png_ptr, const png3d_pvs3_t *pvs3,
             return NULL;
         }
     }
-
+/* allocate the temp_row once (rowbytes bytes) */
+state->temp_row = (png_byte *)png_calloc(png_ptr, rowbytes);
+if (state->temp_row == NULL)
+{
+    for (png_uint_32 j = 0; j < i; j++)
+        png_free(png_ptr, state->z_buffers[j]);
+    png_free(png_ptr, state->z_buffers);
+    png_free(png_ptr, state);
+    return NULL;
+}
     /* Select filter function based on predictor */
     if (pvs3->predictor == 0)  /* XOR */
         state->filter_fn = png3d_filter_row_xor;
@@ -316,11 +330,11 @@ png3d_write_state_free(png_struct *png_ptr, struct png3d_write_state *state)
         }
         png_free(png_ptr, state->z_buffers);
     }
-
+    if (state->temp_row != NULL)
+        png_free(png_ptr, state->temp_row);
     png_free(png_ptr, state);
 }
 
-/* Apply 3D filter to a row during write */
 void
 png3d_filter_write_row(png_struct *png_ptr, png_row_info *row_info,
     png_byte *row, struct png3d_write_state *state)
@@ -340,11 +354,18 @@ png3d_filter_write_row(png_struct *png_ptr, png_row_info *row_info,
     if (state->current_z > 0)
         prev_z_row = state->z_buffers[state->current_row_in_z];
 
-    /* Apply the 3D filter */
+    /* Make a copy of the original row (unfiltered). We must save the original
+     * bytes into the z_buffers for later predictors, but we must not overwrite
+     * prev_z_row (which points at the same slot) until we've used it in the
+     * filter computation — so copy original into a temp buffer first.
+     */
+    memcpy(state->temp_row, row, row_info->rowbytes);
+
+    /* Apply the 3D filter in-place (this mutates 'row' to the filtered form) */
     state->filter_fn(png_ptr, row_info, row, prev_row, prev_z_row);
 
-    /* Save current row for next row's filtering */
-    memcpy(state->z_buffers[state->current_row_in_z], row, row_info->rowbytes);
+    /* Save the ORIGINAL (unfiltered) row into the z_buffer slot for future use */
+    memcpy(state->z_buffers[state->current_row_in_z], state->temp_row, row_info->rowbytes);
 
     /* Update position tracking */
     state->current_row_in_z++;
@@ -354,4 +375,25 @@ png3d_filter_write_row(png_struct *png_ptr, png_row_info *row_info,
         state->current_z++;
     }
 }
-`
+
+
+/* Add near bottom of src/png3d_filter.c (after static helpers) */
+png3d_write_state_t *
+png3d_write_state_new_public(png_struct *png_ptr, const png3d_pvs3_t *pvs3,
+    size_t rowbytes)
+{
+    return (png3d_write_state_t *)png3d_write_state_new(png_ptr, pvs3, rowbytes);
+}
+
+void
+png3d_write_state_free_public(png_struct *png_ptr, png3d_write_state_t *state)
+{
+    png3d_write_state_free(png_ptr, (struct png3d_write_state *)state);
+}
+
+void
+png3d_filter_write_row_public(png_struct *png_ptr, png_row_info *row_info,
+    png_byte *row, png3d_write_state_t *state)
+{
+    png3d_filter_write_row(png_ptr, row_info, row, (struct png3d_write_state *)state);
+}

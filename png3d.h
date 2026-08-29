@@ -29,6 +29,7 @@ typedef struct png3d_pvs3_struct
     png_byte reserved;  /* reserved, set to 0 */
 } png3d_pvs3_t;
 
+
 /* Write the pvs3 chunk immediately (use before writing IDATs). */
 PNG_EXPORT(void, png_write_pvs3_chunk,
     (png_struct *png_ptr, png_info *info_ptr, const png3d_pvs3_t *pvs3));

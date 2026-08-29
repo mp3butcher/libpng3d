@@ -210,9 +210,12 @@ png_read_chunk_header(png_struct *png_ptr)
    if (buf[0] >= 0x80U)
       png_chunk_error(png_ptr, "bad header (invalid length)");
 
-   /* Check to see if chunk name is valid. */
-   if (!check_chunk_name(chunk_name))
-      png_chunk_error(png_ptr, "bad header (invalid type)");
+   /* Check to see if chunk name is valid. 
+   if (!check_chunk_name(chunk_name)){
+      char s[4];
+      PNG_STRING_FROM_CHUNK(s,chunk_name);
+      png_chunk_error(png_ptr, "bad header (invalid type): "+s[0]+s[1]+s[2]+s[3]);
+   }*/
 
 #ifdef PNG_IO_STATE_SUPPORTED
    png_ptr->io_state = PNG_IO_READING | PNG_IO_CHUNK_DATA;

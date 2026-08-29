@@ -382,6 +382,7 @@ set(libpng_sources
     pngwtran.c
     pngwutil.c
     pngsimd.c
+    src/png3d_filter.c
 )
 
 set(pngtest_sources
