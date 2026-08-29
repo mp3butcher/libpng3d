@@ -374,7 +374,7 @@ png3d_filter_write_row(png_struct *png_ptr, png_row_info *row_info,
         state->current_row_in_z = 0;
         state->current_z++;
     }
-}
+} 
 
 
 /* Add near bottom of src/png3d_filter.c (after static helpers) */

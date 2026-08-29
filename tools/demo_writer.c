@@ -8,28 +8,48 @@
 #include "png.h"
 #include "png3d.h"
 #include "png3d_filter.h"
-
-/* Parameters for the synthetic volume */
+#include <inttypes.h>
+#include <math.h>
+#include <sys/stat.h>
+/* Parameters */
 #define NX 512
 #define NY 512
 #define NZ 512
-#define BLOCK 8   /* block size in each axis (8x8x8) */
+#define BLOCK 8
 
-/* Value function: gives per-block value; ensures adjacent blocks have nearby values.
- * We choose a simple ramp-like function across block coordinates.
- */
 static inline unsigned char block_value(int bx, int by, int bz)
 {
-    /* scale coordinates to produce variations but keep nearby values */
     int v = (3*bx + 5*by + 7*bz) & 0xFF;
     return (unsigned char)v;
 }
 
-/* Helper to write one file either with or without 3D filtering.
+static double compute_entropy_bits_per_byte(const uint64_t hist[256], uint64_t total)
+{
+    if (total == 0) return 0.0;
+    double entropy = 0.0;
+    for (int i = 0; i < 256; ++i) {
+        if (hist[i] == 0) continue;
+        double p = (double)hist[i] / (double)total;
+        entropy -= p * (log(p) / log(2.0));
+    }
+    return entropy;
+}
+
+static int64_t get_file_size(const char *path)
+{
+    struct stat st;
+    if (stat(path, &st) != 0) return -1;
+    return (int64_t)st.st_size;
+}
+
+/* Writes volume and fills histograms.
  * filename: output filename
- * use_3d:   non-zero -> enable 3D PAETH3 filtering (pvs3.predictor = 1)
+ * use_3d: non-zero -> apply 3D PAETH3 before png_write_row()
+ * comp_level: 0..9 compression level to pass to png_set_compression_level
+ * hist_orig and hist_filt must be arrays of 256 uint64_t, will be filled.
  */
-int write_volume_png(const char *filename, int use_3d)
+int write_volume_png(const char *filename, int use_3d, int comp_level,
+                     uint64_t hist_orig[256], uint64_t hist_filt[256])
 {
     FILE *fp = fopen(filename, "wb");
     if (!fp) { perror("fopen"); return 1; }
@@ -42,20 +62,19 @@ int write_volume_png(const char *filename, int use_3d)
     if (setjmp(png_jmpbuf(png_ptr))) {
         png_destroy_write_struct(&png_ptr, &info_ptr);
         fclose(fp);
-        fprintf(stderr, "libpng error\n");
+        fprintf(stderr, "libpng fatal error\n");
         return 1;
     }
 
     png_init_io(png_ptr, fp);
 
-    /* PNG dimensions:
-     * width  = NX
-     * height = NY * NZ (we emit rows for each (z,y))
-     */
+    /* Set compression level before writing IDATs */
+    png_set_compression_level(png_ptr, comp_level);
+
+    /* Dimensions: width = NX, height = NY * NZ (z-major stacking) */
     png_uint_32 img_width = NX;
     png_uint_32 img_height = (png_uint_32)NY * (png_uint_32)NZ;
 
-    /* Grayscale 8-bit */
     png_set_IHDR(png_ptr, info_ptr, img_width, img_height, 8,
                  PNG_COLOR_TYPE_GRAY, PNG_INTERLACE_NONE,
                  PNG_COMPRESSION_TYPE_DEFAULT, PNG_FILTER_TYPE_DEFAULT);
@@ -65,27 +84,16 @@ int write_volume_png(const char *filename, int use_3d)
     /* Prepare pvs3 metadata */
     png3d_pvs3_t pvs3;
     memset(&pvs3, 0, sizeof(pvs3));
-    pvs3.nx = NX;
-    pvs3.ny = NY;
-    pvs3.nz = NZ;
-    /* rowsPerCell: how many PNG rows form one logical grid row.
-     * For our mapping, each z layer contains NY rows, so use rowsPerCell = NY.
-     */
+    pvs3.nx = NX; pvs3.ny = NY; pvs3.nz = NZ;
     pvs3.rowsPerCell = NY;
-    /* cellBytes not used by filtering logic below, set reasonably:
-     * bytes per row (width * channels) = NX * 1
-     */
     pvs3.cellBytes = NX;
-    pvs3.mapping = 0; /* slice-major, row-major within slice (as used elsewhere) */
-    pvs3.predictor = use_3d ? 1 : 0; /* 1 = PAETH3, 0 = XOR/no 3D */
+    pvs3.mapping = 0;
+    pvs3.predictor = use_3d ? 1 : 0;
     pvs3.version = 1;
     pvs3.reserved = 0;
-
-    /* Write pvs3 ancillary chunk immediately (caller should do this before IDATs) */
     png_write_pvs3_chunk(png_ptr, info_ptr, &pvs3);
 
-    /* Prepare row buffer and row_info */
-    size_t rowbytes = (size_t)NX; /* 1 channel * 1 byte per sample */
+    size_t rowbytes = (size_t)NX;
     png_bytep row = (png_bytep)malloc(rowbytes);
     if (!row) { fprintf(stderr, "malloc row failed\n"); png_destroy_write_struct(&png_ptr, &info_ptr); fclose(fp); return 1; }
 
@@ -95,9 +103,11 @@ int write_volume_png(const char *filename, int use_3d)
     row_info.color_type = PNG_COLOR_TYPE_GRAY;
     row_info.bit_depth = 8;
     row_info.channels = 1;
-    row_info.pixel_depth = 8; /* channels * bit_depth */
+    row_info.pixel_depth = 8;
 
-    /* If using 3D filtering, create a write-state */
+    memset(hist_orig, 0, sizeof(uint64_t) * 256);
+    memset(hist_filt, 0, sizeof(uint64_t) * 256);
+
     png3d_write_state_t *ws = NULL;
     if (use_3d) {
         ws = png3d_write_state_new_public(png_ptr, &pvs3, rowbytes);
@@ -110,11 +120,9 @@ int write_volume_png(const char *filename, int use_3d)
         }
     }
 
-    /* Generate and write rows. Loop order matches README: for each z, for each y */
-    /* We write image rows in order: z=0..NZ-1, y=0..NY-1  (height = NZ*NY) */
+    uint64_t total_bytes = 0;
     for (int z = 0; z < NZ; ++z) {
         for (int y = 0; y < NY; ++y) {
-            /* Fill row bytes by block logic */
             int by = y / BLOCK;
             int bz = z / BLOCK;
             for (int x = 0; x < NX; ++x) {
@@ -123,21 +131,33 @@ int write_volume_png(const char *filename, int use_3d)
                 row[x] = v;
             }
 
-            /* Apply 3D filter if requested (this mutates row inplace) */
+            /* Update original histogram (before any 3D filtering) */
+            for (size_t k = 0; k < rowbytes; ++k) {
+                hist_orig[(unsigned char)row[k]]++;
+            }
+
+            /* If using 3D filter, apply it (this mutates row). Then update hist_filt with filtered bytes. */
             if (use_3d) {
                 png3d_filter_write_row_public(png_ptr, &row_info, row, ws);
+                for (size_t k = 0; k < rowbytes; ++k) {
+                    hist_filt[(unsigned char)row[k]]++;
+                }
+            } else {
+                /* No 3D filtering: just count filtered histogram identical to original */
+                for (size_t k = 0; k < rowbytes; ++k) {
+                    hist_filt[(unsigned char)row[k]]++;
+                }
             }
 
             png_write_row(png_ptr, row);
+            total_bytes += rowbytes;
         }
-
-        /* Optional: progress output per z layer */
-        if ((z & 0x3F) == 0) { /* every 64 layers */
+        /* Progress */
+        if ((z & 0x3F) == 0) {
             fprintf(stderr, "%s: z=%d/%d\n", filename, z, NZ);
         }
     }
 
-    /* Cleanup */
     if (ws)
         png3d_write_state_free_public(png_ptr, ws);
 
@@ -146,25 +166,83 @@ int write_volume_png(const char *filename, int use_3d)
     free(row);
     fclose(fp);
 
+    if (total_bytes != (uint64_t)NX * NY * NZ) {
+        fprintf(stderr, "Warning: total bytes (%" PRIu64 ") mismatch\n", total_bytes);
+    }
+
     return 0;
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
-    printf("Writing volume (this may take a while) ...\n");
+    int comp_level = 6; /* default */
+    if (argc >= 2) {
+        int v = atoi(argv[1]);
+        if (v < 0) v = 0;
+        if (v > 9) v = 9;
+        comp_level = v;
+    }
 
-    /* Write without 3D filtering */
-    if (write_volume_png("pvs3_no3d.png", 0) != 0) {
+    printf("Compression level: %d\n", comp_level);
+    printf("Generating volume %dx%dx%d with %dx%dx%d blocks\n", NX, NY, NZ, BLOCK, BLOCK, BLOCK);
+    printf("This may take a while and produce very large files.\n");
+
+    uint64_t hist_orig_no3d[256], hist_filt_no3d[256];
+    uint64_t hist_orig_3d[256], hist_filt_3d[256];
+
+    printf("Writing pvs3_no3d.png (no 3D filtering)...\n");
+    if (write_volume_png("pvs3_no3d.png", 0, comp_level, hist_orig_no3d, hist_filt_no3d) != 0) {
         fprintf(stderr, "Failed to write pvs3_no3d.png\n");
         return 1;
     }
 
-    /* Write with 3D PAETH3 filtering */
-    if (write_volume_png("pvs3_paeth3.png", 1) != 0) {
+    printf("Writing pvs3_paeth3.png (3D PAETH3 filtering)...\n");
+    if (write_volume_png("pvs3_paeth3.png", 1, comp_level, hist_orig_3d, hist_filt_3d) != 0) {
         fprintf(stderr, "Failed to write pvs3_paeth3.png\n");
         return 1;
     }
 
-    printf("Done. Outputs: pvs3_no3d.png, pvs3_paeth3.png\n");
+    /* Compute entropies */
+    uint64_t total_bytes = (uint64_t)NX * NY * NZ;
+    double ent_orig_no3d = compute_entropy_bits_per_byte(hist_orig_no3d, total_bytes);
+    double ent_filt_no3d = compute_entropy_bits_per_byte(hist_filt_no3d, total_bytes);
+    double ent_orig_3d = compute_entropy_bits_per_byte(hist_orig_3d, total_bytes);
+    double ent_filt_3d = compute_entropy_bits_per_byte(hist_filt_3d, total_bytes);
+
+    int64_t size_no3d = get_file_size("pvs3_no3d.png");
+    int64_t size_3d = get_file_size("pvs3_paeth3.png");
+
+    printf("\n--- Results ---\n");
+    printf("Total voxels/bytes: %" PRIu64 "\n", total_bytes);
+
+    printf("\nNo 3D filtering (pvs3_no3d.png):\n");
+    printf("  File size: %" PRId64 " bytes\n", size_no3d);
+    printf("  Entropy (original) : %.6f bits/byte\n", ent_orig_no3d);
+    printf("  Entropy (filtered) : %.6f bits/byte\n", ent_filt_no3d);
+
+    printf("\n3D PAETH3 filtering (pvs3_paeth3.png):\n");
+    printf("  File size: %" PRId64 " bytes\n", size_3d);
+    printf("  Entropy (original) : %.6f bits/byte\n", ent_orig_3d);
+    printf("  Entropy (filtered) : %.6f bits/byte\n", ent_filt_3d);
+
+    if (size_no3d > 0 && size_3d > 0) {
+        double ratio = ((double)size_3d) / ((double)size_no3d);
+        printf("\nFile size ratio (3D / no3d) = %.3f (smaller is better)\n", ratio);
+    }
+
+    /* Print top histogram bins for filtered 3D to help debugging (most common bytes) */
+    printf("\nTop 10 byte values in 3D-filtered data (value: count):\n");
+    for (int t = 0; t < 10; ++t) {
+        /* find max remaining */
+        uint64_t maxc = 0; int maxi = -1;
+        for (int i = 0; i < 256; ++i) {
+            if (hist_filt_3d[i] > maxc) { maxc = hist_filt_3d[i]; maxi = i; }
+        }
+        if (maxi < 0) break;
+        printf("  %3d : %" PRIu64 "\n", maxi, maxc);
+        hist_filt_3d[maxi] = 0; /* zero out to find next */
+    }
+
+    printf("\nDone.\n");
     return 0;
 }
