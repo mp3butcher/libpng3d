@@ -70,7 +70,15 @@ int write_volume_png(const char *filename, int use_3d, int comp_level,
 
     /* Set compression level before writing IDATs */
     png_set_compression_level(png_ptr, comp_level);
-
+    /* Use builtin PNG filters when not using the custom 3D filter.
+     * If use_3d == 0 (pvs3_no3d.png) let libpng try all filters to pick
+     * the best per-scanline filter. If use_3d != 0 we disable libpng
+     * filtering so the custom 3D filter output is written verbatim. */
+    if (!use_3d) {
+        png_set_filter(png_ptr, PNG_FILTER_TYPE_BASE, PNG_ALL_FILTERS);
+    } else {
+        png_set_filter(png_ptr, PNG_FILTER_TYPE_BASE, PNG_FILTER_NONE);
+    }
     /* Dimensions: width = NX, height = NY * NZ (z-major stacking) */
     png_uint_32 img_width = NX;
     png_uint_32 img_height = (png_uint_32)NY * (png_uint_32)NZ;

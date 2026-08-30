@@ -95,50 +95,64 @@ png3d_filter_row_paeth3(png_struct *png_ptr, png_row_info *row_info,
     size_t i;
     size_t rowbytes = row_info->rowbytes;
     png_byte *rp = row;
-    const png_byte *pp = prev_row;    /* Row above in XY plane */
-    const png_byte *dp = prev_z_row;  /* Row above in Z dimension */
-    unsigned int bpp = (row_info->pixel_depth + 7) >> 3;
-    size_t istop;
-
-    /* Silence compiler warning */
-    (void)png_ptr;
-
-    /* First bpp bytes: no left neighbor, only vertical predictors from prev_row and prev_z_row */
-    if (prev_row != NULL && prev_z_row != NULL)
-    {
-        for (i = 0; i < bpp; i++)
+        const png_byte *pp = prev_row;    /* Row above in XY plane */
+        const png_byte *dp = prev_z_row;  /* Row above in Z dimension */
+        unsigned int bpp = (row_info->pixel_depth + 7) >> 3;
+        size_t istop;
+    
+        /* Silence compiler warning */
+        (void)png_ptr;
+           /* Copy original row so predictors (especially left/above-left) read the
+         * original bytes, not bytes already modified by filtering earlier in the
+         * row. This matches the predictor semantics that expect original neighbors. */
         {
-            png_byte p = png3d_paeth3(0, pp[i], 0, dp[i]);
-            rp[i] = (png_byte)(((int)rp[i] - (int)p) & 0xff);
+            png_byte *orig = (png_byte *)png_malloc(png_ptr, rowbytes);
+            if (orig == NULL)
+                return; /* allocation failure: bail out (no filtering) */
+    
+            memcpy(orig, row, rowbytes);
+    
+            /* First bpp bytes: no left neighbor, only vertical/back predictors */
+            if (pp != NULL && dp != NULL)
+            {
+                for (i = 0; i < bpp; i++)
+                {
+                    png_byte p = png3d_paeth3(0, pp[i], 0, dp[i]);
+                    row[i] = (png_byte)(((int)orig[i] - (int)p) & 0xff);
+                }
+            }
+            else if (pp != NULL)
+            {
+                for (i = 0; i < bpp; i++)
+                {
+                    row[i] = (png_byte)(((int)orig[i] - (int)pp[i]) & 0xff);
+                }
+            }
+            else if (dp != NULL)
+            {
+                for (i = 0; i < bpp; i++)
+                {
+                    row[i] = (png_byte)(((int)orig[i] - (int)dp[i]) & 0xff);
+                }
+            }
+            /* else: no previous data, leave byte as-is (orig) */
+    
+            /* Remaining bytes: apply full PAETH3 with left, above, above-left, back neighbors.
+             * Use 'orig' for left/above-left so we don't use already-filtered data. */
+            istop = rowbytes - bpp;
+            for (i = 0; i < istop; i++)
+            {
+                size_t idx = bpp + i;
+                png_byte a = orig[idx - bpp];                  /* original left */
+                png_byte b = (pp != NULL) ? pp[idx] : 0;       /* above */
+                png_byte c = (pp != NULL) ? pp[idx - bpp] : 0; /* above-left */
+                png_byte d = (dp != NULL) ? dp[idx] : 0;       /* back (previous z) */
+                png_byte p = png3d_paeth3(a, b, c, d);
+                row[idx] = (png_byte)(((int)orig[idx] - (int)p) & 0xff);
+            }
+    
+            png_free(png_ptr, orig);
         }
-    }
-    else if (prev_row != NULL)
-    {
-        for (i = 0; i < bpp; i++)
-        {
-            rp[i] = (png_byte)(((int)rp[i] - (int)pp[i]) & 0xff);
-        }
-    }
-    else if (prev_z_row != NULL)
-    {
-        for (i = 0; i < bpp; i++)
-        {
-            rp[i] = (png_byte)(((int)rp[i] - (int)dp[i]) & 0xff);
-        }
-    }
-    /* else: no previous data, leave byte as-is */
-
-    /* Remaining bytes: apply full PAETH3 with left, above, above-left, back neighbors */
-    istop = rowbytes - bpp;
-    for (i = 0; i < istop; i++)
-    {
-        png_byte a = rp[bpp + i - bpp];        /* Left (one bpp back) */
-        png_byte b = (pp != NULL) ? pp[bpp + i] : 0;      /* Above */
-        png_byte c = (pp != NULL) ? pp[bpp + i - bpp] : 0;  /* Above-left */
-        png_byte d = (dp != NULL) ? dp[bpp + i] : 0;      /* Back (previous z) */
-        png_byte p = png3d_paeth3(a, b, c, d);
-        rp[bpp + i] = (png_byte)(((int)rp[bpp + i] - (int)p) & 0xff);
-    }
 }
 
 /* ============================================================================
