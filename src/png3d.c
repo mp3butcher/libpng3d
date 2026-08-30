@@ -18,7 +18,7 @@ static png_uint_32 read_u32_be(const unsigned char *buf)
 }
 
 /* Chunk name as 4 ASCII bytes; keep a terminating zero for convenience */
-static const png_byte pvs3_name[5] = {'p','v','s','3','\0'};
+static const png_byte pvs3_name[5] = {'P','V','S','D','\0'};
 
 void png_write_pvs3_chunk(png_struct *png_ptr, png_info *info_ptr, const png3d_pvs3_t *pvs3)
 {
@@ -51,8 +51,8 @@ int png_get_pvs3_from_info(png_struct *png_ptr, png_info *info_ptr, png3d_pvs3_t
     for (int i = 0; i < n; ++i)
     {
         /* Compare first four bytes of name */
-        if (entries[i].name[0] == 'p' && entries[i].name[1] == 'v' &&
-            entries[i].name[2] == 's' && entries[i].name[3] == '3')
+        if (entries[i].name[0] == 'P' && entries[i].name[1] == 'V' &&
+            entries[i].name[2] == 'S' && entries[i].name[3] == 'D')
         {
             if (entries[i].data != NULL && entries[i].size >= 24)
             {
