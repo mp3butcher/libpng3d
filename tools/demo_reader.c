@@ -62,7 +62,7 @@
  
      /* Keep unknown chunks so the pvs3 chunk is stored in info_ptr */
  #ifdef PNG_HANDLE_CHUNK_ALWAYS
-     png_set_keep_unknown_chunks(png_ptr, PNG_HANDLE_CHUNK_ALWAYS, (png_byte*)"pvs3", 1);
+     png_set_keep_unknown_chunks(png_ptr, PNG_HANDLE_CHUNK_ALWAYS, (png_byte*)"PVSD", 1);
  #endif
  
      png_read_info(png_ptr, info_ptr);
@@ -81,28 +81,35 @@
      /* Extract pvs3 chunk */
      png3d_pvs3_t pvs3;
      int has_pvs3 = png_get_pvs3_from_info(png_ptr, info_ptr, &pvs3);
-     if (!has_pvs3) {
-         fprintf(stderr, "Warning: pvs3 chunk not found. Will assume no 3D filtering.\n");
-         memset(&pvs3, 0, sizeof(pvs3));
-         pvs3.predictor = 0;
-         pvs3.rowsPerCell = height;
-         pvs3.nx = width;
-         pvs3.ny = height;
-         pvs3.nz = 1;
-     } else {
-         printf("  Found pvs3: nx=%u ny=%u nz=%u rowsPerCell=%u cellBytes=%u mapping=%u predictor=%u\n",
-                (unsigned)pvs3.nx, (unsigned)pvs3.ny, (unsigned)pvs3.nz,
-                (unsigned)pvs3.rowsPerCell, (unsigned)pvs3.cellBytes,
-                (unsigned)pvs3.mapping, (unsigned)pvs3.predictor);
-     }
+         if (!has_pvs3) {
+                fprintf(stderr, "Warning: pvs3 chunk not found. Will assume no 3D filtering.\n");
+                memset(&pvs3, 0, sizeof(pvs3));
+                pvs3.predictor = 0;
+                pvs3.rowsPerCell = height;
+                pvs3.nx = width;
+                pvs3.ny = height;
+                pvs3.nz = 1;
+                pvs3.cellBytes = 1; /* default to 1 byte per cell for compatibility */
+            } else {
+                if (pvs3.cellBytes == 0) pvs3.cellBytes = 1; /* guard against bad chunk */
+                printf("  Found pvs3: nx=%u ny=%u nz=%u rowsPerCell=%u cellBytes=%u mapping=%u predictor=%u\n",
+                       (unsigned)pvs3.nx, (unsigned)pvs3.ny, (unsigned)pvs3.nz,
+                       (unsigned)pvs3.rowsPerCell, (unsigned)pvs3.cellBytes,
+                       (unsigned)pvs3.mapping, (unsigned)pvs3.predictor);
+            }
  
      /* Validate row size vs pvs3.nx if possible */
-     if ((png_uint_32)rowbytes != pvs3.nx * channels * ((bit_depth + 7)/8) && pvs3.nx != 0) {
-         fprintf(stderr, "Warning: rowbytes (%zu) doesn't match pvs3.nx*channels*(bitdepth/8) (%u). Continuing anyway.\n",
-                 (size_t)rowbytes, pvs3.nx * channels * ((bit_depth+7)/8));
+
+    {
+            png_uint_32 expected = 0;
+            if (pvs3.nx != 0)
+                expected = pvs3.nx * pvs3.cellBytes;
+            if (expected != 0 && (png_uint_32)rowbytes != expected) {
+                fprintf(stderr, "Warning: rowbytes (%zu) doesn't match pvs3.nx * cellBytes (%u). Continuing anyway.\n",
+                        (size_t)rowbytes, expected);
+            }
      }
- 
-     /* Prepare prev_z_buffers: allocate rowsPerCell pointers, each rowbytes in size */
+    /* Prepare prev_z_buffers: allocate rowsPerCell pointers, each rowbytes in size */
      png_uint_32 rowsPerCell = pvs3.rowsPerCell;
      if (rowsPerCell == 0) rowsPerCell = 1;
      png_byte **prev_z_buffers = (png_byte **)malloc(sizeof(png_byte *) * rowsPerCell);
@@ -169,35 +176,52 @@
          memcpy(prev_z_buffers[current_row_in_z], row, rowbytes);
          memcpy(last_row, row, rowbytes);
  
-         /* Validate against synthetic block pattern (only for grayscale single-channel images). */
-         png_uint_32 NY = pvs3.ny;
-         png_uint_32 NX = pvs3.nx;
-         png_uint_32 NZ = pvs3.nz;
-         png_uint_32 z = 0, y = 0;
-         if (NY > 0) {
-             z = (png_uint_32)(r / (uint64_t)NY);
-             y = (png_uint_32)(r % (uint64_t)NY);
-         } else {
-             z = 0; y = (png_uint_32)r;
-         }
- 
-         if (bit_depth == 8 && channels == 1) {
-             for (png_uint_32 x = 0; x < NX; ++x) {
-                 unsigned char got = row[x];
-                 unsigned char expect = block_value(x / BLOCK, y / BLOCK, z / BLOCK);
-                 if (got != expect) {
-                     if (mismatches < 20) {
-                         fprintf(stderr, "Mismatch at r=%" PRIu64 " (z=%u,y=%u), x=%u : got=%u expected=%u\n",
-                                 r, z, y, x, (unsigned)got, (unsigned)expect);
-                     }
-                     mismatches++;
-                 }
-                 total_voxels++;
-             }
-         } else {
-             /* If not matchable, skip validation but still count bytes */
-             total_voxels += rowbytes;
-         }
+        /* Validate against synthetic block pattern.
+         * Writer packs a fixed-size bitset per-cell (pvs3.cellBytes). Reconstruct
+         * the same deterministic bitset and compare per-byte. */
+        png_uint_32 NY = pvs3.ny;
+        png_uint_32 NX = pvs3.nx;
++        png_uint_32 NZ = pvs3.nz;
+        png_uint_32 z = 0, y = 0;
+        if (NY > 0) {
+            z = (png_uint_32)(r / (uint64_t)NY);
+            y = (png_uint_32)(r % (uint64_t)NY);
+        } else {
+            z = 0; y = (png_uint_32)r;
+        }
+
+        if (bit_depth == 8 && channels == 1 && NX > 0 && pvs3.cellBytes > 0) {
+            for (png_uint_32 x = 0; x < NX; ++x) {
+                int bx = x / BLOCK;
+                int by = y / BLOCK;
+                int bz = z / BLOCK;
+                /* Recreate the same mask used by the writer:
+                 * mask bit k is set if (3*bx + 5*by + 7*bz + k) is odd. */
+                uint64_t mask = 0;
+                int bits = (int)pvs3.cellBytes * 8;
+                for (int k = 0; k < bits && k < 64; ++k) {
+                    if (((3*bx + 5*by + 7*bz + k) & 1) != 0)
+                        mask |= (1ULL << k);
+                }
+
+                size_t base = (size_t)x * (size_t)pvs3.cellBytes;
+                for (size_t b = 0; b < (size_t)pvs3.cellBytes; ++b) {
+                    unsigned char got = row[base + b];
+                    unsigned char expect = (unsigned char)((mask >> (8 * b)) & 0xFF);
+                    if (got != expect) {
+                        if (mismatches < 20) {
+                            fprintf(stderr, "Mismatch at r=%" PRIu64 " (z=%u,y=%u), cell x=%u byte=%zu : got=%u expected=%u\n",
+                                    r, z, y, x, b, (unsigned)got, (unsigned)expect);
+                        }
+                        mismatches++;
+                    }
+                    total_voxels++;
+                }
+            }
+        } else {
+            /* If not matchable, skip validation but still count bytes */
+            total_voxels += rowbytes;
+        }
  
          /* advance indices */
          current_row_in_z++;

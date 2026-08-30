@@ -12,9 +12,10 @@
 #include <math.h>
 #include <sys/stat.h>
 /* Parameters */
-#define NX 512
-#define NY 512
-#define NZ 512
+#define NX 256
+#define NY 256
+#define NZ 256
+#define CELLBYTES 1024/8
 #define BLOCK 8
 
 static inline unsigned char block_value(int bx, int by, int bz)
@@ -94,14 +95,14 @@ int write_volume_png(const char *filename, int use_3d, int comp_level,
     memset(&pvs3, 0, sizeof(pvs3));
     pvs3.nx = NX; pvs3.ny = NY; pvs3.nz = NZ;
     pvs3.rowsPerCell = NY;
-    pvs3.cellBytes = NX;
+    pvs3.cellBytes = CELLBYTES;
     pvs3.mapping = 0;
     pvs3.predictor = use_3d ? 1 : 0;
     pvs3.version = 1;
     pvs3.reserved = 0;
     png_write_pvs3_chunk(png_ptr, info_ptr, &pvs3);
 
-    size_t rowbytes = (size_t)NX;
+    size_t rowbytes = (size_t)NX*pvs3.cellBytes;
     png_bytep row = (png_bytep)malloc(rowbytes);
     if (!row) { fprintf(stderr, "malloc row failed\n"); png_destroy_write_struct(&png_ptr, &info_ptr); fclose(fp); return 1; }
 
@@ -133,11 +134,26 @@ int write_volume_png(const char *filename, int use_3d, int comp_level,
         for (int y = 0; y < NY; ++y) {
             int by = y / BLOCK;
             int bz = z / BLOCK;
+            /* Fill the row with NX cells. Each cell is a fixed-size bitset             * occupying pvs3.cellBytes bytes. We generate a deterministic
+             * bit pattern per-cell based on the block indices so the demo
+             * data is non-trivial and repeatable. Pack little-endian. */
             for (int x = 0; x < NX; ++x) {
-                int bx = x / BLOCK;
-                unsigned char v = block_value(bx, by, bz);
-                row[x] = v;
-            }
+                    int bx = x / BLOCK;
+                    /* Construct a deterministic bitset mask for this cell.
+                     * mask bit k is set if (3*bx + 5*by + 7*bz + k) is odd. */
+                    uint64_t mask = 0;
+                    int bits = (int)pvs3.cellBytes * 8;
+                    for (int k = 0; k < bits && k < 64; ++k) {
+                        if (((3*bx + 5*by + 7*bz + k) & 1) != 0)
+                            mask |= (1ULL << k);
+                    }
+    
+                    /* Write the mask into the row buffer (little-endian per cell) */
+                    size_t base = (size_t)x * (size_t)pvs3.cellBytes;
+                    for (size_t b = 0; b < (size_t)pvs3.cellBytes; ++b) {
+                        row[base + b] = (png_byte)((mask >> (8 * b)) & 0xFF);
+                    }
+                }
 
             /* Update original histogram (before any 3D filtering) */
             for (size_t k = 0; k < rowbytes; ++k) {
@@ -174,7 +190,7 @@ int write_volume_png(const char *filename, int use_3d, int comp_level,
     free(row);
     fclose(fp);
 
-    if (total_bytes != (uint64_t)NX * NY * NZ) {
+    if (total_bytes != (uint64_t)NX * NY * NZ*CELLBYTES) {
         fprintf(stderr, "Warning: total bytes (%" PRIu64 ") mismatch\n", total_bytes);
     }
 
