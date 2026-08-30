@@ -98,17 +98,29 @@
                        (unsigned)pvs3.mapping, (unsigned)pvs3.predictor);
             }
  
-     /* Validate row size vs pvs3.nx if possible */
-
-    {
-            png_uint_32 expected = 0;
-            if (pvs3.nx != 0)
-                expected = pvs3.nx * pvs3.cellBytes;
-            if (expected != 0 && (png_uint_32)rowbytes != expected) {
-                fprintf(stderr, "Warning: rowbytes (%zu) doesn't match pvs3.nx * cellBytes (%u). Continuing anyway.\n",
-                        (size_t)rowbytes, expected);
+   /* Ensure the pvs3.cellBytes agrees with the PNG rowbytes. If it doesn't,
+     * try to infer the correct cellBytes from rowbytes/ nx (fallback). This
+     * tolerates writers that set IHDR width to NX while actually storing
+     * NX*cellBytes bytes per row (or vice-versa). */
+    if (pvs3.nx != 0) {
+            png_size_t expected = (png_size_t)pvs3.nx * (png_size_t)pvs3.cellBytes;
+            if (expected != rowbytes) {
+                if ((rowbytes % pvs3.nx) == 0) {
+                    png_uint_32 inferred = (png_uint_32)(rowbytes / pvs3.nx);
+                    fprintf(stderr,
+                            "Warning: pvs3.cellBytes (%u) disagrees with image rowbytes (%zu). "
+                            "Inferring cellBytes=%u from rowbytes/nx and using that.\n",
+                            (unsigned)pvs3.cellBytes, (size_t)rowbytes, (unsigned)inferred);
+                    pvs3.cellBytes = inferred;
+                } else {
+                   fprintf(stderr,
+                            "Warning: pvs3.cellBytes (%u) and rowbytes (%zu) mismatch and cannot infer cellBytes (rowbytes not divisible by nx). "
+                            "Falling back to cellBytes=1.\n",
+                            (unsigned)pvs3.cellBytes, (size_t)rowbytes);
+                    pvs3.cellBytes = 1;
+                }
             }
-     }
+        }
     /* Prepare prev_z_buffers: allocate rowsPerCell pointers, each rowbytes in size */
      png_uint_32 rowsPerCell = pvs3.rowsPerCell;
      if (rowsPerCell == 0) rowsPerCell = 1;
@@ -137,13 +149,23 @@
      if (!row) { fprintf(stderr, "malloc row failed\n"); goto cleanup; }
  
      /* Prepare png_row_info struct as expected by the 3D unfilter functions */
-     png_row_info row_info;
-     row_info.width = width;
-     row_info.rowbytes = (png_size_t)rowbytes;
-     row_info.color_type = color_type;
-     row_info.bit_depth = bit_depth;
-     row_info.channels = (int)channels;
-     row_info.pixel_depth = (int)(bit_depth * channels);
+   /* Prepare png_row_info struct as expected by the 3D unfilter functions.
+     *
+     * Important: the 3D filter code expects 'pixel_depth' to represent the
+     * number of bits per logical voxel (i.e. bytes per cell * 8). The PNG
+     * IHDR 'width' may be the physical pixel columns (which for this demo
+     * equals nx * cellBytes). We store the logical number of cells in
+     * row_info.width so the 3D filter computes bpp = (pixel_depth+7)>>3
+     * correctly as pvs3.cellBytes.
+    */
+    png_row_info row_info;
+    row_info.width = pvs3.nx; /* logical cells per row */
+    row_info.rowbytes = (png_size_t)rowbytes; /* physical bytes per row */
+    row_info.color_type = color_type;
+    row_info.bit_depth = bit_depth;
+    row_info.channels = (int)channels;
+    /* bytes per voxel = pvs3.cellBytes -> pixel_depth (bits) = 8 * cellBytes */
+    row_info.pixel_depth = (int)(8 * (int)pvs3.cellBytes);
  
      /* iterate rows in the same order as writer: z major (z outer, y inner)
       * The writer produced height = NY * NZ rows, with row index r = z*NY + y.
@@ -181,7 +203,7 @@
          * the same deterministic bitset and compare per-byte. */
         png_uint_32 NY = pvs3.ny;
         png_uint_32 NX = pvs3.nx;
-+        png_uint_32 NZ = pvs3.nz;
+        png_uint_32 NZ = pvs3.nz;
         png_uint_32 z = 0, y = 0;
         if (NY > 0) {
             z = (png_uint_32)(r / (uint64_t)NY);

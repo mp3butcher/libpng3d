@@ -15,7 +15,8 @@
 #define NX 256
 #define NY 256
 #define NZ 256
-#define CELLBYTES 1024/8
+//1024bits field
+#define CELLBYTES 128
 #define BLOCK 8
 
 static inline unsigned char block_value(int bx, int by, int bz)
