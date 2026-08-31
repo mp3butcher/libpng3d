@@ -178,7 +178,15 @@
  
      for (uint64_t r = 0; r < total_rows; ++r) {
          png_read_row(png_ptr, row, NULL); /* libpng already removed PNG row filters */
- 
+        /* Diagnostic: dump the raw bytes as returned by png_read_row for the very
+         * first row (before we apply the 3D unfilter). This shows what the IDAT
+         * contains after libpng's built-in row filters. */
+        if (r == 0) {
+                fprintf(stderr, "DEBUG reader: raw first row from png_read_row (first 64 bytes):");
+                for (size_t kk = 0; kk < 64 && kk < rowbytes; ++kk)
+                    fprintf(stderr, " %02x", (unsigned)row[kk]);
+                fprintf(stderr, "\n");
+            }
          /* determine prev_row and prev_z_row pointers expected by unfilter functions */
          png_byte *prev_row = NULL;
          const png_byte *prev_z_row = NULL;
@@ -186,13 +194,20 @@
              prev_row = last_row;
          if (current_z > 0)
              prev_z_row = prev_z_buffers[current_row_in_z];
- 
-         /* apply 3D unfilter according to predictor */
+          /* apply 3D unfilter according to predictor */
          if (pvs3.predictor == 1) {
-             png3d_unfilter_row_paeth3(png_ptr, &row_info, row, prev_row, prev_z_row);
-         } else {
-             png3d_unfilter_row_xor(png_ptr, &row_info, row, prev_row, prev_z_row);
-         }
+                 png3d_unfilter_row_paeth3(png_ptr, &row_info, row, prev_row, prev_z_row);
+             } else {
+                 png3d_unfilter_row_xor(png_ptr, &row_info, row, prev_row, prev_z_row);
+             }
+        /* Diagnostic: dump the recovered original first row for comparison */
+          if (r == 0) {
+                  fprintf(stderr, "DEBUG reader: recovered first row after 3D unfilter (first 64 bytes):");
+                  for (size_t kk = 0; kk < 64 && kk < rowbytes; ++kk)
+                     fprintf(stderr, " %02x", (unsigned)row[kk]);
+                  fprintf(stderr, "\n");
+             }
+              
   
          /* After unfilter, row contains recovered original bytes. Save into prev_z_buffers[current_row_in_z] and last_row. */
          memcpy(prev_z_buffers[current_row_in_z], row, rowbytes);
@@ -213,37 +228,30 @@
         }
 
         if (bit_depth == 8 && channels == 1 && NX > 0 && pvs3.cellBytes > 0) {
-            for (png_uint_32 x = 0; x < NX; ++x) {
-                int bx = x / BLOCK;
-                int by = y / BLOCK;
-                int bz = z / BLOCK;
-                /* Recreate the same mask used by the writer:
-                 * mask bit k is set if (3*bx + 5*by + 7*bz + k) is odd. */
-                uint64_t mask = 0;
-                int bits = (int)pvs3.cellBytes * 8;
-                for (int k = 0; k < bits && k < 64; ++k) {
-                    if (((3*bx + 5*by + 7*bz + k) & 1) != 0)
-                        mask |= (1ULL << k);
-                }
-
-                size_t base = (size_t)x * (size_t)pvs3.cellBytes;
-                for (size_t b = 0; b < (size_t)pvs3.cellBytes; ++b) {
-                    unsigned char got = row[base + b];
-                    unsigned char expect = (unsigned char)((mask >> (8 * b)) & 0xFF);
-                    if (got != expect) {
-                        if (mismatches < 20) {
-                            fprintf(stderr, "Mismatch at r=%" PRIu64 " (z=%u,y=%u), cell x=%u byte=%zu : got=%u expected=%u\n",
-                                    r, z, y, x, b, (unsigned)got, (unsigned)expect);
+                     for (png_uint_32 x = 0; x < NX; ++x) {
+                            int bx = x / BLOCK;
+                            int by = y / BLOCK;
+                            int bz = z / BLOCK;
+                            unsigned char basev = block_value(bx, by, bz);
+                            unsigned acc = (unsigned)((bx * 7) + (by * 11) + (bz * 13)) & 0xFF;
+                            size_t base = (size_t)x * (size_t)pvs3.cellBytes;
+                            for (size_t b = 0; b < (size_t)pvs3.cellBytes; ++b) {
+                                unsigned char got = row[base + b];
+                                unsigned char expect = (unsigned char)((unsigned)basev + (unsigned)(b * 37) + acc);
+                                if (got != expect) {
+                                    if (mismatches < 20) {
+                                        fprintf(stderr, "Mismatch at r=%" PRIu64 " (z=%u,y=%u), cell x=%u byte=%zu : got=%u expected=%u\n",
+                                                r, z, y, x, b, (unsigned)got, (unsigned)expect);
+                                    }
+                                    mismatches++;
+                                }
+                                total_voxels++;
+                            }
                         }
-                        mismatches++;
+                    } else {
+                        /* If not matchable, skip validation but still count bytes */
+                        total_voxels += rowbytes;
                     }
-                    total_voxels++;
-                }
-            }
-        } else {
-            /* If not matchable, skip validation but still count bytes */
-            total_voxels += rowbytes;
-        }
  
          /* advance indices */
          current_row_in_z++;

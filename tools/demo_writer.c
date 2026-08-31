@@ -12,11 +12,16 @@
 #include <math.h>
 #include <sys/stat.h>
 /* Parameters */
-#define NX 256
-#define NY 256
-#define NZ 256
+#define NX 512
+#define NY 512
+#define NZ 512
 //1024bits field
-#define CELLBYTES 128
+/* Number of bytes used to represent the per-cell bitset.
++ * If you intend a N-bit bitset, set CELL_BYTES = (N + 7) / 8.
++ * For example: 128-bit bitset -> CELL_BYTES = 16. */
+#ifndef CELL_BYTES
+#define CELL_BYTES 1
+#endif
 #define BLOCK 8
 
 static inline unsigned char block_value(int bx, int by, int bz)
@@ -81,26 +86,32 @@ int write_volume_png(const char *filename, int use_3d, int comp_level,
     } else {
         png_set_filter(png_ptr, PNG_FILTER_TYPE_BASE, PNG_FILTER_NONE);
     }
-    /* Dimensions: width = NX, height = NY * NZ (z-major stacking) */
-    png_uint_32 img_width = NX;
+
+    /* Prepare pvs3 metadata */
+ /* Prepare pvs3 metadata first so we can compute the physical image width:
+     * each logical row has NX cells, each cell occupies pvs3.cellBytes bytes,
+    * and we represent each byte as a separate grayscale pixel (8-bit). */
+    png3d_pvs3_t pvs3;
+    memset(&pvs3, 0, sizeof(pvs3));
+    pvs3.nx = NX; pvs3.ny = NY; pvs3.nz = NZ;
+    pvs3.rowsPerCell = NY;
+    /* bytes per logical cell (a cell stores a fixed-size bitset) */
+    pvs3.cellBytes = CELL_BYTES;
+    pvs3.mapping = 0;
+    pvs3.predictor = use_3d ? 1 : 0;
+    pvs3.version = 1;
+    pvs3.reserved = 0;
+
+    /* Dimensions: physical width = NX * cellBytes, height = NY * NZ (z-major stacking) */
+    png_uint_32 img_width = (png_uint_32)((png_uint_32)NX * (png_uint_32)pvs3.cellBytes);
     png_uint_32 img_height = (png_uint_32)NY * (png_uint_32)NZ;
 
     png_set_IHDR(png_ptr, info_ptr, img_width, img_height, 8,
                  PNG_COLOR_TYPE_GRAY, PNG_INTERLACE_NONE,
                  PNG_COMPRESSION_TYPE_DEFAULT, PNG_FILTER_TYPE_DEFAULT);
 
+    /* Write IHDR first, then our ancillary pvs3 chunk (caller expects chunk before IDAT) */
     png_write_info(png_ptr, info_ptr);
-
-    /* Prepare pvs3 metadata */
-    png3d_pvs3_t pvs3;
-    memset(&pvs3, 0, sizeof(pvs3));
-    pvs3.nx = NX; pvs3.ny = NY; pvs3.nz = NZ;
-    pvs3.rowsPerCell = NY;
-    pvs3.cellBytes = CELLBYTES;
-    pvs3.mapping = 0;
-    pvs3.predictor = use_3d ? 1 : 0;
-    pvs3.version = 1;
-    pvs3.reserved = 0;
     png_write_pvs3_chunk(png_ptr, info_ptr, &pvs3);
 
     size_t rowbytes = (size_t)NX*pvs3.cellBytes;
@@ -108,12 +119,16 @@ int write_volume_png(const char *filename, int use_3d, int comp_level,
     if (!row) { fprintf(stderr, "malloc row failed\n"); png_destroy_write_struct(&png_ptr, &info_ptr); fclose(fp); return 1; }
 
     png_row_info row_info;
-    row_info.width = NX;
-    row_info.rowbytes = (png_size_t)rowbytes;
-    row_info.color_type = PNG_COLOR_TYPE_GRAY;
-    row_info.bit_depth = 8;
-    row_info.channels = 1;
-    row_info.pixel_depth = 8;
+        /* row_info.width is the logical cell count for the 3D filter helpers;
+         * the filter uses row_info->rowbytes and pixel_depth to compute bpp. */
+        row_info.width = (png_uint_32)NX;               /* logical cells per row */
+       row_info.rowbytes = (png_size_t)rowbytes;       /* physical bytes per row */
+        row_info.color_type = PNG_COLOR_TYPE_GRAY;
+        row_info.bit_depth = 8;
+        row_info.channels = 1;
+        /* pixel_depth should represent bits per logical voxel/cell:
+         * bpp = (pixel_depth + 7) >> 3 -> set pixel_depth = 8 * cellBytes */
+        row_info.pixel_depth = (int)(8 * (int)pvs3.cellBytes);
 
     memset(hist_orig, 0, sizeof(uint64_t) * 256);
     memset(hist_filt, 0, sizeof(uint64_t) * 256);
@@ -138,21 +153,19 @@ int write_volume_png(const char *filename, int use_3d, int comp_level,
             /* Fill the row with NX cells. Each cell is a fixed-size bitset             * occupying pvs3.cellBytes bytes. We generate a deterministic
              * bit pattern per-cell based on the block indices so the demo
              * data is non-trivial and repeatable. Pack little-endian. */
+                      /* Fill the row with NX cells. Each cell occupies pvs3.cellBytes bytes.
+             * For debugging and better entropy we create a deterministic per-byte
+             * pattern derived from the block_value and indices, rather than a
+             * single alternating-bit mask which produced too little variety. */
             for (int x = 0; x < NX; ++x) {
                     int bx = x / BLOCK;
-                    /* Construct a deterministic bitset mask for this cell.
-                     * mask bit k is set if (3*bx + 5*by + 7*bz + k) is odd. */
-                    uint64_t mask = 0;
-                    int bits = (int)pvs3.cellBytes * 8;
-                    for (int k = 0; k < bits && k < 64; ++k) {
-                        if (((3*bx + 5*by + 7*bz + k) & 1) != 0)
-                            mask |= (1ULL << k);
-                    }
-    
-                    /* Write the mask into the row buffer (little-endian per cell) */
+                    unsigned char basev = block_value(bx, by, bz);
                     size_t base = (size_t)x * (size_t)pvs3.cellBytes;
+                    /* produce deterministic but varied bytes per cell:
+                     * byte b = basev + (b * 37) + ((bx*7 + by*11 + bz*13) & 0xFF) */
+                    unsigned acc = (unsigned)((bx * 7) + (by * 11) + (bz * 13));
                     for (size_t b = 0; b < (size_t)pvs3.cellBytes; ++b) {
-                        row[base + b] = (png_byte)((mask >> (8 * b)) & 0xFF);
+                        row[base + b] = (png_byte)((unsigned)basev + (unsigned)(b * 37) + (acc & 0xFF));
                     }
                 }
 
@@ -160,19 +173,34 @@ int write_volume_png(const char *filename, int use_3d, int comp_level,
             for (size_t k = 0; k < rowbytes; ++k) {
                 hist_orig[(unsigned char)row[k]]++;
             }
-
-            /* If using 3D filter, apply it (this mutates row). Then update hist_filt with filtered bytes. */
-            if (use_3d) {
-                png3d_filter_write_row_public(png_ptr, &row_info, row, ws);
-                for (size_t k = 0; k < rowbytes; ++k) {
-                    hist_filt[(unsigned char)row[k]]++;
-                }
-            } else {
-                /* No 3D filtering: just count filtered histogram identical to original */
-                for (size_t k = 0; k < rowbytes; ++k) {
-                    hist_filt[(unsigned char)row[k]]++;
-                }
-            }
+            /* I using 3D filter, apply it (this mutates row). Then update hist_filt with filtered bytes. */
+                       if (use_3d) {
+                                /* dump the first row original bytes before filtering for diagnostics */
+                               if (z == 0 && y == 0) {
+                                    fprintf(stderr, "DEBUG writer: original first row (first 64 bytes):");
+                                    for (size_t kk = 0; kk < 64 && kk < rowbytes; ++kk)
+                                        fprintf(stderr, " %02x", (unsigned)row[kk]);
+                                    fprintf(stderr, "\n");
+                                }
+                                                png3d_filter_write_row_public(png_ptr, &row_info, row, ws);
+                
+                                /* dump the filtered bytes for the same first row for diagnostics */
+                                if (z == 0 && y == 0) {
+                                    fprintf(stderr, "DEBUG writer: filtered first row (first 64 bytes):");
+                                    for (size_t kk = 0; kk < 64 && kk < rowbytes; ++kk)
+                                        fprintf(stderr, " %02x", (unsigned)row[kk]);
+                                    fprintf(stderr, "\n");
+                                }
+                
+                                for (size_t k = 0; k < rowbytes; ++k) {
+                                    hist_filt[(unsigned char)row[k]]++;
+                                }
+                           } else {
+                                /* No 3D filtering: just count filtered histogram identical to original */
+                                for (size_t k = 0; k < rowbytes; ++k) {
+                                    hist_filt[(unsigned char)row[k]]++;
+                                }
+                            }
 
             png_write_row(png_ptr, row);
             total_bytes += rowbytes;
@@ -191,7 +219,7 @@ int write_volume_png(const char *filename, int use_3d, int comp_level,
     free(row);
     fclose(fp);
 
-    if (total_bytes != (uint64_t)NX * NY * NZ*CELLBYTES) {
+    if (total_bytes != (uint64_t)NX * NY * NZ*CELL_BYTES) {
         fprintf(stderr, "Warning: total bytes (%" PRIu64 ") mismatch\n", total_bytes);
     }
 
@@ -227,19 +255,25 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    /* Compute entropies */
-    uint64_t total_bytes = (uint64_t)NX * NY * NZ;
+/* Compute entropies.
+     * hist_* arrays count physical bytes written to the PNG (one entry per
+     * physical byte). When each logical cell occupies CELL_BYTES bytes the
+     * total number of bytes equals voxels * CELL_BYTES. */
+    uint64_t total_voxels = (uint64_t)NX * (uint64_t)NY * (uint64_t)NZ;
+    uint64_t total_bytes = total_voxels * (uint64_t)CELL_BYTES;
     double ent_orig_no3d = compute_entropy_bits_per_byte(hist_orig_no3d, total_bytes);
     double ent_filt_no3d = compute_entropy_bits_per_byte(hist_filt_no3d, total_bytes);
     double ent_orig_3d = compute_entropy_bits_per_byte(hist_orig_3d, total_bytes);
     double ent_filt_3d = compute_entropy_bits_per_byte(hist_filt_3d, total_bytes);
+ 
 
     int64_t size_no3d = get_file_size("pvs3_no3d.png");
     int64_t size_3d = get_file_size("pvs3_paeth3.png");
 
     printf("\n--- Results ---\n");
-    printf("Total voxels/bytes: %" PRIu64 "\n", total_bytes);
-
+    printf("Total voxels: %" PRIu64 "  Total bytes (voxels * CELL_BYTES=%d): %" PRIu64 "\n",
+               total_voxels, CELL_BYTES, total_bytes);
+    
     printf("\nNo 3D filtering (pvs3_no3d.png):\n");
     printf("  File size: %" PRId64 " bytes\n", size_no3d);
     printf("  Entropy (original) : %.6f bits/byte\n", ent_orig_no3d);
